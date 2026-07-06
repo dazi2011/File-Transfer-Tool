@@ -1,8 +1,8 @@
 using System;
 using System.Globalization;
 using System.IO;
-using System.Security.Cryptography;
 using System.Text;
+using System.Threading;
 using System.Web;
 using System.Web.UI;
 
@@ -59,6 +59,8 @@ public partial class upload_chunk : Page
         int chunkIndex = TransferUtility.ParseIntForm(Request, "chunkIndex");
         int totalChunks = TransferUtility.ParseIntForm(Request, "totalChunks");
         long totalSize = TransferUtility.ParseLongForm(Request, "totalSize");
+        long chunkStart = TransferUtility.ParseLongForm(Request, "chunkStart");
+        long chunkSize = TransferUtility.ParseLongForm(Request, "chunkSize");
 
         if (totalChunks <= 0 || totalChunks > MaxChunkCount)
         {
@@ -71,6 +73,20 @@ public partial class upload_chunk : Page
         if (totalSize < 0)
         {
             throw new InvalidOperationException("Total file size cannot be negative.");
+        }
+        if (chunkSize <= 0 || chunkSize > TransferUtility.GetMaxChunkBytes())
+        {
+            throw new InvalidOperationException("Chunk size is outside the supported range.");
+        }
+        if (chunkStart < 0 || chunkStart > totalSize)
+        {
+            throw new InvalidOperationException("Chunk start is outside the file range.");
+        }
+
+        long expectedTotalChunks = totalSize == 0 ? 1 : (((totalSize - 1) / chunkSize) + 1);
+        if (expectedTotalChunks != totalChunks)
+        {
+            throw new InvalidOperationException("Chunk count does not match the declared chunk size.");
         }
 
         long maxFileBytes = TransferUtility.GetMaxFileBytes();
@@ -97,32 +113,22 @@ public partial class upload_chunk : Page
             throw new InvalidOperationException("Chunk is empty.");
         }
 
+        long expectedChunkStart = chunkIndex * chunkSize;
+        long expectedChunkLength = Math.Min(chunkSize, totalSize - expectedChunkStart);
+        if (chunkStart != expectedChunkStart)
+        {
+            throw new InvalidOperationException("Chunk start does not match the chunk index.");
+        }
+        if (chunk.ContentLength != expectedChunkLength)
+        {
+            throw new InvalidOperationException("Chunk length does not match the declared upload layout.");
+        }
+
         string sessionPath = TransferUtility.GetTempUploadPath(uploadId);
         TransferUtility.TouchTempUploadSession(sessionPath);
-        WriteOrValidateMetadata(sessionPath, fileName, group, totalChunks, totalSize);
+        WriteOrValidateMetadata(sessionPath, fileName, group, totalChunks, totalSize, chunkSize);
 
-        string chunkPath = Path.Combine(sessionPath, GetChunkFileName(chunkIndex));
-        string tempChunkPath = chunkPath + "." + Guid.NewGuid().ToString("N") + ".uploading";
-        long bytesWritten = SavePostedFile(chunk, tempChunkPath);
-
-        if (bytesWritten != chunk.ContentLength)
-        {
-            SafeDelete(tempChunkPath);
-            throw new IOException("Chunk length changed while saving.");
-        }
-
-        if (File.Exists(chunkPath) && new FileInfo(chunkPath).Length == bytesWritten)
-        {
-            SafeDelete(tempChunkPath);
-        }
-        else
-        {
-            if (File.Exists(chunkPath))
-            {
-                File.Delete(chunkPath);
-            }
-            File.Move(tempChunkPath, chunkPath);
-        }
+        long bytesWritten = WriteChunkToStaging(sessionPath, chunk, chunkIndex, chunkStart, totalSize);
 
         TransferUtility.TouchTempUploadSession(sessionPath);
 
@@ -148,7 +154,7 @@ public partial class upload_chunk : Page
         using (mergeLock)
         {
             TransferUtility.TouchTempUploadSession(sessionPath);
-            MergeResult mergeResult = MergeChunks(sessionPath, group, fileName, totalChunks, totalSize, uploadId);
+            MergeResult mergeResult = FinalizeStagedUpload(sessionPath, group, fileName, totalSize);
             result.Complete = true;
             result.Merging = false;
             result.StoredFileName = Path.GetFileName(mergeResult.FilePath);
@@ -168,57 +174,61 @@ public partial class upload_chunk : Page
         return result;
     }
 
-    private static long SavePostedFile(HttpPostedFile postedFile, string destinationPath)
+    private static long WriteChunkToStaging(string sessionPath, HttpPostedFile postedFile, int chunkIndex, long chunkStart, long totalSize)
     {
-        using (FileStream output = new FileStream(destinationPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, CopyBufferBytes, FileOptions.SequentialScan))
+        string markerPath = Path.Combine(sessionPath, GetChunkMarkerName(chunkIndex));
+        string stagingPath = GetStagingPath(sessionPath);
+
+        using (FileStream sessionLock = AcquireSessionLock(sessionPath))
         {
-            return CopyStream(postedFile.InputStream, output);
+            if (File.Exists(markerPath))
+            {
+                return postedFile.ContentLength;
+            }
+
+            using (FileStream output = new FileStream(stagingPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read, CopyBufferBytes, FileOptions.RandomAccess))
+            {
+                if (output.Length != totalSize)
+                {
+                    output.SetLength(totalSize);
+                }
+
+                output.Seek(chunkStart, SeekOrigin.Begin);
+                long bytesWritten = CopyStream(postedFile.InputStream, output);
+                if (bytesWritten != postedFile.ContentLength)
+                {
+                    throw new IOException("Chunk length changed while saving.");
+                }
+
+                output.Flush(true);
+                File.WriteAllText(markerPath, bytesWritten.ToString(CultureInfo.InvariantCulture), Encoding.UTF8);
+                sessionLock.SetLength(0);
+                return bytesWritten;
+            }
         }
     }
 
-    private static MergeResult MergeChunks(string sessionPath, string group, string fileName, int totalChunks, long expectedSize, string uploadId)
+    private static MergeResult FinalizeStagedUpload(string sessionPath, string group, string fileName, long expectedSize)
     {
         string finalPath = TransferUtility.GetUniqueDestinationPath(group, fileName);
-        string mergePath = Path.Combine(sessionPath, "merged_" + uploadId + ".merging");
-        long totalWritten = 0;
-        byte[] buffer = new byte[CopyBufferBytes];
-        byte[] hash;
-
-        using (SHA256 sha256 = SHA256.Create())
-        using (FileStream output = new FileStream(mergePath, FileMode.Create, FileAccess.Write, FileShare.None, CopyBufferBytes, FileOptions.SequentialScan))
+        string stagingPath = GetStagingPath(sessionPath);
+        FileInfo stagingFile = new FileInfo(stagingPath);
+        if (!stagingFile.Exists)
         {
-            for (int i = 0; i < totalChunks; i++)
-            {
-                string chunkPath = Path.Combine(sessionPath, GetChunkFileName(i));
-                using (FileStream input = new FileStream(chunkPath, FileMode.Open, FileAccess.Read, FileShare.Read, CopyBufferBytes, FileOptions.SequentialScan))
-                {
-                    int read;
-                    while ((read = input.Read(buffer, 0, buffer.Length)) > 0)
-                    {
-                        output.Write(buffer, 0, read);
-                        sha256.TransformBlock(buffer, 0, read, null, 0);
-                        totalWritten += read;
-                    }
-                }
-            }
-
-            sha256.TransformFinalBlock(new byte[0], 0, 0);
-
-            if (totalWritten != expectedSize)
-            {
-                throw new IOException("Merged file size does not match upload metadata.");
-            }
-
-            output.Flush(true);
-            hash = sha256.Hash;
+            throw new IOException("Staged upload file is missing.");
+        }
+        if (stagingFile.Length != expectedSize)
+        {
+            throw new IOException("Staged upload file size does not match upload metadata.");
         }
 
-        File.Move(mergePath, finalPath);
+        string sha256 = TransferUtility.ShouldComputeSha256() ? TransferUtility.Sha256Hex(stagingPath) : "";
+        File.Move(stagingPath, finalPath);
 
         MergeResult result = new MergeResult();
         result.FilePath = finalPath;
-        result.Size = totalWritten;
-        result.Sha256 = TransferUtility.ToHex(hash);
+        result.Size = expectedSize;
+        result.Sha256 = sha256;
         return result;
     }
 
@@ -237,13 +247,14 @@ public partial class upload_chunk : Page
         return total;
     }
 
-    private static void WriteOrValidateMetadata(string sessionPath, string fileName, string group, int totalChunks, long totalSize)
+    private static void WriteOrValidateMetadata(string sessionPath, string fileName, string group, int totalChunks, long totalSize, long chunkSize)
     {
         string metadataPath = Path.Combine(sessionPath, "upload.meta");
         string metadata = "group=" + group + "\n" +
                           "fileName=" + Convert.ToBase64String(Encoding.UTF8.GetBytes(fileName)) + "\n" +
                           "totalChunks=" + totalChunks.ToString(CultureInfo.InvariantCulture) + "\n" +
-                          "totalSize=" + totalSize.ToString(CultureInfo.InvariantCulture) + "\n";
+                          "totalSize=" + totalSize.ToString(CultureInfo.InvariantCulture) + "\n" +
+                          "chunkSize=" + chunkSize.ToString(CultureInfo.InvariantCulture) + "\n";
 
         lock (MetadataLock)
         {
@@ -264,13 +275,31 @@ public partial class upload_chunk : Page
     {
         for (int i = 0; i < totalChunks; i++)
         {
-            if (!File.Exists(Path.Combine(sessionPath, GetChunkFileName(i))))
+            if (!File.Exists(Path.Combine(sessionPath, GetChunkMarkerName(i))))
             {
                 return false;
             }
         }
 
         return true;
+    }
+
+    private static FileStream AcquireSessionLock(string sessionPath)
+    {
+        string lockPath = Path.Combine(sessionPath, "session.lock");
+        for (int i = 0; i < 7200; i++)
+        {
+            try
+            {
+                return new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+            }
+            catch (IOException)
+            {
+                Thread.Sleep(250);
+            }
+        }
+
+        throw new IOException("Timed out waiting for the upload session lock.");
     }
 
     private static bool TryAcquireMergeLock(string sessionPath, out FileStream mergeLock)
@@ -289,23 +318,14 @@ public partial class upload_chunk : Page
         }
     }
 
-    private static string GetChunkFileName(int chunkIndex)
+    private static string GetChunkMarkerName(int chunkIndex)
     {
-        return "chunk_" + chunkIndex.ToString("D8", CultureInfo.InvariantCulture) + ".part";
+        return "chunk_" + chunkIndex.ToString("D8", CultureInfo.InvariantCulture) + ".ok";
     }
 
-    private static void SafeDelete(string path)
+    private static string GetStagingPath(string sessionPath)
     {
-        try
-        {
-            if (File.Exists(path))
-            {
-                File.Delete(path);
-            }
-        }
-        catch
-        {
-        }
+        return Path.Combine(sessionPath, "upload.staging");
     }
 
     private void WriteError(int statusCode, string message)
@@ -337,7 +357,10 @@ public partial class upload_chunk : Page
             builder.Append(",\"fileName\":\"").Append(JsonEscape(result.StoredFileName)).Append("\"");
             builder.Append(",\"size\":").Append(result.StoredSize.ToString(CultureInfo.InvariantCulture));
             builder.Append(",\"sizeText\":\"").Append(JsonEscape(TransferUtility.FormatFileSize(result.StoredSize))).Append("\"");
-            builder.Append(",\"sha256\":\"").Append(JsonEscape(result.Sha256)).Append("\"");
+            if (!String.IsNullOrEmpty(result.Sha256))
+            {
+                builder.Append(",\"sha256\":\"").Append(JsonEscape(result.Sha256)).Append("\"");
+            }
         }
 
         builder.Append("}");

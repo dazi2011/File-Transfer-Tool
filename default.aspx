@@ -659,11 +659,12 @@
         row.querySelector(".progress > span").style.width = "100%";
         var detail = document.createElement("div");
         detail.className = "meta";
-        detail.textContent = "SHA-256 " + finalResult.sha256;
+        detail.textContent = finalResult.sha256 ? "SHA-256 " + finalResult.sha256 : "Stored as " + finalResult.fileName + " (" + finalResult.sizeText + ")";
         row.appendChild(detail);
     }
 
     async function uploadChunk(file, blob, uploadId, group, chunkIndex, totalChunks) {
+        var chunkStart = chunkIndex * maxChunkBytes;
         var data = new FormData();
         data.append("uploadId", uploadId);
         data.append("group", group);
@@ -671,6 +672,8 @@
         data.append("chunkIndex", String(chunkIndex));
         data.append("totalChunks", String(totalChunks));
         data.append("totalSize", String(file.size));
+        data.append("chunkStart", String(chunkStart));
+        data.append("chunkSize", String(maxChunkBytes));
         data.append("accessToken", getToken());
         data.append("chunk", blob, file.name + ".part" + chunkIndex);
 
@@ -718,7 +721,7 @@
         var elapsed = Math.max(1, (Date.now() - startedAt) / 1000);
         var speed = uploadedBytes / elapsed;
         row.querySelector(".progress > span").style.width = percent.toFixed(2) + "%";
-        row.querySelector(".queue-state").textContent = merging ? "Merging" : Math.floor(percent) + "% · " + completedChunks + "/" + totalChunks + " · " + formatBytes(speed) + "/s";
+        row.querySelector(".queue-state").textContent = merging ? "Finalizing" : Math.floor(percent) + "% · " + completedChunks + "/" + totalChunks + " · " + formatBytes(speed) + "/s";
     }
 
     function setQueueError(row, message) {

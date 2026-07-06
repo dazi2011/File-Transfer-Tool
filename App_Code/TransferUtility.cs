@@ -219,6 +219,14 @@ public static class TransferUtility
         return Math.Max(1, Math.Min(8, configured));
     }
 
+    public static bool ShouldComputeSha256()
+    {
+        string configured = GetSetting("TransferComputeSha256", "false");
+        return String.Equals(configured, "true", StringComparison.OrdinalIgnoreCase) ||
+               String.Equals(configured, "1", StringComparison.OrdinalIgnoreCase) ||
+               String.Equals(configured, "yes", StringComparison.OrdinalIgnoreCase);
+    }
+
     public static TimeSpan GetTempUploadMaxAge()
     {
         int configured;
@@ -419,6 +427,7 @@ public static class TransferUtility
         foreach (FileInfo file in directory.GetFiles("*", SearchOption.AllDirectories))
         {
             if (String.Equals(file.Name, "merge.lock", StringComparison.OrdinalIgnoreCase) ||
+                String.Equals(file.Name, "session.lock", StringComparison.OrdinalIgnoreCase) ||
                 file.Name.EndsWith(".uploading", StringComparison.OrdinalIgnoreCase))
             {
                 if (IsFileLocked(file.FullName))
